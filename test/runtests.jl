@@ -69,6 +69,25 @@ const REPL = Base.require(Base.PkgId(Base.UUID("3fa0cd96-eef1-5676-8a61-b3b8758b
 struct FakeREPL <: REPL.AbstractREPL end
 Base.active_module(::FakeREPL) = Main
 
+# A stand-in for the line editor of a `LineEditREPL` of Julia 1.12 and later, recording what `report` calls.
+module FakeLineEdit
+mutable struct MIState
+    n_keys_pressed::Int
+    async_channel::Channel{Function}
+    calls::Vector{Symbol}
+end
+state(s::MIState) = s
+clear_input_area(s::MIState) = push!(s.calls, :clear)
+refresh_line(s::MIState) = push!(s.calls, :refresh)
+end
+struct EditREPL <: REPL.AbstractREPL
+    mistate::FakeLineEdit.MIState
+end
+Base.active_module(::EditREPL) = Main
+struct FakeBackend
+    ast_transforms::Vector{Any}
+end
+
 @testset "StartupPackage" begin
     @testset "definitions at top level, statements in __init__" begin
         delete!(ENV, "STARTUP_PACKAGE_TEST")
@@ -342,6 +361,34 @@ Base.active_module(::FakeREPL) = Main
         finally
             Core.eval(Base, :(is_interactive = false))
             Core.eval(Base, :(active_repl_backend = nothing))
+        end
+    end
+
+    @testset "startup errors" begin
+        output = tempname()
+        for keys in (0, 1)
+            mistate = FakeLineEdit.MIState(keys, Channel{Function}(), Symbol[])
+            Core.eval(Base, :(active_repl = $(EditREPL(mistate))))
+            Core.eval(Base, :(active_repl_backend = $(FakeBackend(Any[]))))
+            at_prompt = Ref("")
+            try
+                open(output, "w") do io
+                    redirect_stderr(io) do
+                        StartupPackage.report("failed")
+                        # As the REPL runs it while it waits for input, and then the transforms of each input.
+                        take!(mistate.async_channel)(mistate)
+                        flush(io)
+                        at_prompt[] = read(output, String)
+                        foreach(transform -> transform(:(1 + 1)), Base.active_repl_backend.ast_transforms)
+                    end
+                end
+            finally
+                Core.eval(Base, :(active_repl = $(FakeREPL())))
+                Core.eval(Base, :(active_repl_backend = nothing))
+            end
+            # Shown at once only if nothing was typed, and only once.
+            @test (at_prompt[], read(output, String), mistate.calls) ==
+                (keys == 0 ? ("failed\n", "failed\n", [:clear, :refresh]) : ("", "failed\n", Symbol[]))
         end
     end
 

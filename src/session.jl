@@ -227,7 +227,10 @@ end
 """
     report(message::String)
 
-Print `message` to `stderr` when the REPL evaluates the next input, or at once without a REPL.
+Print `message` to `stderr` at once without a REPL or above a REPL prompt that nothing was typed into yet, and
+otherwise when the REPL evaluates the next input.
+
+Only the REPL of Julia 1.12 and later counts the keys typed, so earlier versions always wait for the next input.
 
 # Examples
 ```jldoctest
@@ -239,11 +242,26 @@ function report(message::String)
     backend = isdefined(Base, :active_repl_backend) ? Base.active_repl_backend : nothing
     if isnothing(backend)
         println(stderr, message)
-    else
-        pending = Ref(true)
-        push!(backend.ast_transforms, function (ex)
-            pending[] && (pending[] = false; println(stderr, message))
-            return ex
+        return nothing
+    end
+    pending = Threads.Atomic{Bool}(true)
+    show_once() = Threads.atomic_xchg!(pending, false) && println(stderr, message)
+    push!(backend.ast_transforms, function (ex)
+        show_once()
+        return ex
+    end)
+    repl = isdefined(Base, :active_repl) ? Base.active_repl : nothing
+    mistate = hasfield(typeof(repl), :mistate) ? getfield(repl, :mistate) : nothing
+    if !isnothing(mistate) && hasfield(typeof(mistate), :n_keys_pressed)
+        LineEdit = parentmodule(typeof(mistate))
+        # A task, as the REPL takes the function only while it waits for input, under the lock for the keys.
+        Threads.@spawn put!(mistate.async_channel, function (s)
+            if s.n_keys_pressed == 0 && pending[]
+                LineEdit.clear_input_area(LineEdit.state(s))
+                show_once()
+                LineEdit.refresh_line(s)
+            end
+            return :ignore
         end)
     end
     return nothing
